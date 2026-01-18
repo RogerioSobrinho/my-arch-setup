@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Automated Installer
-# VERSION:      1.4.0 (Final Stable)
-# TARGET:       Workstation (Laptop/Desktop) & Gaming
-# AUTHOR:       Rogerio Sobrinho (Gemini Reviewed)
-# DOCS:         Compliant with Arch Wiki & CIS Benchmarks
-# CHANGES:      Merged v1.3 Fixes (GPU/Permissions) with v1.2 Logging Standard
+# PROJECT:      Arch Linux Installer v1.5 (Final Release)
+# TARGET:       Workstation & Gaming
+# AUTHOR:       Rogerio Sobrinho (Reviewed by Gemini)
+# CHANGES:      Fixed mkinitcpio hooks (lvm2), /boot permissions, strict GPU detect
 # ==============================================================================
 
 # --- STRICT MODE ---
@@ -23,14 +21,13 @@ log_info()  { echo -e "${BLUE}[$(date +'%H:%M:%S')] [INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[$(date +'%H:%M:%S')] [WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[$(date +'%H:%M:%S')] [ERROR]${NC} $1" >&2; exit 1; }
 
-# Error trap with line reporting
 error_handler() {
     local line_no=$1
     log_error "Script failed at line $line_no. Installation aborted."
 }
 trap 'error_handler $LINENO' ERR
 
-# --- CONFIGURATION DEFAULTS ---
+# --- CONFIG DEFAULTS ---
 LOCALE="en_US.UTF-8"
 KEYMAP="us-acentos"
 TIMEZONE="America/Sao_Paulo"
@@ -38,45 +35,37 @@ HOSTNAME_DEFAULT="archlinux"
 
 # --- PACKAGE LISTS ---
 
-# 1. System Core (Hardware support + LVM)
-# Note: 'lvm2' is explicitly required for the sd-lvm2 hook
+# Core: lvm2 required for hooks, sof-firmware for audio
 PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware)
 
-# 2. System Utilities (Clean CLI stack)
+# Utils: Clean stack
 PKGS_SYS=(sudo neovim git man-db pacman-contrib unzip p7zip bat eza btop reflector usbutils ripgrep fd)
 
-# 3. Security & Identity (AppArmor + YubiKey)
+# Security: AppArmor + YubiKey
 PKGS_SEC=(pcsclite ccid yubikey-manager bitwarden apparmor)
 
-# 4. Networking
+# Network
 PKGS_NET=(networkmanager chrony firewalld bluez bluez-utils)
 
-# 5. Filesystem Support
+# Filesystem
 PKGS_FS=(efibootmgr cryptsetup dosfstools e2fsprogs ntfs-3g)
 
-# 6. Audio Stack (Pipewire)
+# Audio
 PKGS_AUDIO=(pipewire pipewire-alsa pipewire-pulse wireplumber alsa-firmware)
 
-# 7. Printing
+# Print
 PKGS_PRINT=(cups)
 
-# 8. Fonts (Official Repo - No Bloat)
+# Fonts (Official Nerd Fonts)
 PKGS_FONTS=(
-    noto-fonts                  # Fallback
-    noto-fonts-emoji            # Emoji support
-    ttf-liberation              # Metric-compatible with Arial/Times
-    
-    # Selected Nerd Fonts (Dev Standard)
-    ttf-jetbrains-mono-nerd
-    ttf-cascadia-code-nerd
-    ttf-hack-nerd
-    ttf-firacode-nerd
+    noto-fonts noto-fonts-emoji ttf-liberation
+    ttf-jetbrains-mono-nerd ttf-cascadia-code-nerd ttf-hack-nerd ttf-firacode-nerd
 )
 
-# 9. Applications
+# Apps
 PKGS_APPS=(firefox thunderbird)
 
-# 10. Desktop Environments (Clean Profiles)
+# DE Profiles
 PKGS_SWAY=(
     sway swaybg swayidle swaylock waybar wofi mako ly 
     polkit-gnome thunar gvfs 
@@ -86,7 +75,7 @@ PKGS_SWAY=(
 PKGS_GNOME=(gnome-shell gdm gnome-console nautilus xdg-desktop-portal-gnome gnome-control-center)
 PKGS_KDE=(plasma-desktop sddm dolphin konsole xdg-desktop-portal-kde ark spectacle)
 
-# 11. Gaming Tools (Optional Profile)
+# Gaming
 PKGS_GAME_TOOLS=(steam lutris gamemode mangohud wine-staging winetricks)
 
 # --- HARDWARE DETECTION ---
@@ -114,19 +103,15 @@ detect_cpu_microcode() {
 detect_gpu_drivers() {
     log_info "Scanning PCI bus for GPUs..."
     GPU_PKGS=()
-    
-    # Strict detection: Filter only VGA or 3D controllers to avoid false positives
     local gpu_info
     gpu_info=$(lspci -mm | grep -E "VGA|3D")
 
     if echo "$gpu_info" | grep -iq "NVIDIA"; then
         log_info "NVIDIA GPU detected. Adding proprietary DKMS drivers."
         GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils nvidia-settings)
-    
     elif echo "$gpu_info" | grep -iq "AMD"; then
         log_info "AMD GPU detected. Adding Mesa/Vulkan stack."
         GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu)
-    
     elif echo "$gpu_info" | grep -iq "Intel"; then
         log_info "Intel GPU detected. Adding Mesa/Vulkan stack."
         GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
@@ -136,44 +121,35 @@ detect_gpu_drivers() {
     fi
 }
 
-# --- PRE-FLIGHT CHECKS ---
+# --- PRE-FLIGHT ---
 
 pre_flight_checks() {
-    [[ $EUID -ne 0 ]] && log_error "This script must be run as root."
-    [[ ! -d /sys/firmware/efi/efivars ]] && log_error "System is not booted in UEFI mode."
-    
+    [[ $EUID -ne 0 ]] && log_error "Run as root."
+    [[ ! -d /sys/firmware/efi/efivars ]] && log_error "Not in UEFI mode."
     if ! ping -c 1 archlinux.org &>/dev/null; then
-        log_error "No internet connection. Please connect via iwctl or ethernet."
+        log_error "No internet. Connect via iwctl/ethernet."
     fi
 }
 
-# --- USER INPUT ---
+# --- INPUT ---
 
 collect_user_input() {
     clear
-    echo -e "${BLUE}=== ARCH LINUX INSTALLER V1.4 (FINAL STABLE) ===${NC}"
+    echo -e "${BLUE}=== ARCH LINUX INSTALLER V1.5 ===${NC}"
     
-    # Hostname
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_INPUT
     HOSTNAME_VAL=${HOSTNAME_INPUT:-$HOSTNAME_DEFAULT}
 
-    # Disk
-    echo ""
-    lsblk -d -n -o NAME,SIZE,MODEL,TYPE | grep disk
-    echo ""
+    echo ""; lsblk -d -n -o NAME,SIZE,MODEL,TYPE | grep disk; echo ""
     read -r -p "Target Disk (e.g., nvme0n1): " DISK
     TARGET="/dev/$DISK"
+    [[ ! -b "$TARGET" ]] && log_error "Invalid device."
     
-    [[ ! -b "$TARGET" ]] && log_error "Invalid device: $TARGET"
-    
-    # NVMe vs SATA partition naming
     if [[ "$DISK" =~ "nvme" ]]; then P_SUF="p"; else P_SUF=""; fi
     P_EFI="${TARGET}${P_SUF}1"
     P_ROOT="${TARGET}${P_SUF}2"
 
-    # Profiles
-    echo ""
-    read -r -p "Enable GAMER Profile (Zen Kernel + Drivers)? (y/N): " OPT_GAME
+    echo ""; read -r -p "Enable GAMER Profile (Zen Kernel + Drivers)? (y/N): " OPT_GAME
     if [[ "$OPT_GAME" == "y" ]]; then
         KERNEL_PKG="linux-zen"; HEADER_PKG="linux-zen-headers"
         VMLINUZ="/vmlinuz-linux-zen"; INITRAMFS="/initramfs-linux-zen.img"
@@ -184,115 +160,91 @@ collect_user_input() {
         GPU_PKGS=()
     fi
 
-    echo ""; read -r -p "Enable Hibernation (Physical Swap)? (y/N): " OPT_HIBERNATE
+    echo ""; read -r -p "Enable Hibernation? (y/N): " OPT_HIBERNATE
 
-    # Desktop Environment
-    echo ""; echo "Select Desktop Environment:"
+    echo ""; echo "Select DE:"
     select opt in "Sway" "Gnome" "KDE"; do
         case $opt in
             "Sway") DE_PKGS=("${PKGS_SWAY[@]}"); DM="ly"; DE_NAME="sway"; break ;;
             "Gnome") DE_PKGS=("${PKGS_GNOME[@]}"); DM="gdm"; DE_NAME="gnome"; break ;;
             "KDE") DE_PKGS=("${PKGS_KDE[@]}"); DM="sddm"; DE_NAME="kde"; break ;;
-            *) log_warn "Invalid option." ;;
+            *) log_warn "Invalid." ;;
         esac
     done
 
-    # Credentials
-    echo ""; read -r -p "New Username: " USER_NAME
+    echo ""; read -r -p "Username: " USER_NAME
     read -r -s -p "Password: " USER_PASS; echo ""
 }
 
-# --- INSTALLATION ROUTINE ---
+# --- INSTALL ---
 
 prepare_storage() {
-    log_info "Wiping filesystem signatures on $TARGET..."
+    log_info "Wiping $TARGET..."
     wipefs -af "$TARGET"
     sgdisk -Zo "$TARGET"
-    
-    log_info "Partitioning (GPT)..."
     parted -s "$TARGET" mklabel gpt \
         mkpart ESP fat32 1MiB 512MiB set 1 esp on \
         mkpart cryptroot 512MiB 100%
     partprobe "$TARGET" && sleep 2
 
-    log_info "Encrypting (LUKS2 + Argon2id)..."
-    # Optimization: 4k sector size, disable workqueues for NVMe performance
+    log_info "Encrypting (LUKS2/Argon2id)..."
     cryptsetup luksFormat --type luks2 --sector-size 4096 --verify-passphrase "$P_ROOT"
     cryptsetup open "$P_ROOT" cryptroot \
         --perf-no_read_workqueue --perf-no_write_workqueue --allow-discards
 
-    log_info "Configuring LVM..."
+    log_info "LVM Setup..."
     pvcreate /dev/mapper/cryptroot
     vgcreate vg0 /dev/mapper/cryptroot
 
     if [[ "$OPT_HIBERNATE" == "y" ]]; then
-        log_info "Allocating Swap (34GB)..."
         lvcreate -L 34G -n swap vg0; mkswap -L swap /dev/mapper/vg0-swap
         SWAP_DEVICE="/dev/mapper/vg0-swap"
     else
         SWAP_DEVICE=""
     fi
 
-    log_info "Allocating Root..."
     lvcreate -l 100%FREE -n root vg0
     mkfs.ext4 -L arch_root /dev/mapper/vg0-root
     mkfs.fat -F 32 -n EFI "$P_EFI"
 
-    log_info "Mounting volumes..."
+    log_info "Mounting..."
     mount /dev/mapper/vg0-root /mnt
     mkdir -p /mnt/boot
-    
-    # SECURITY FIX: Mount /boot with strict umask (0077) to prevent random seed leakage warning
-    log_info "Mounting EFI with strict permissions..."
+    # SECURE MOUNT
     mount -o fmask=0077,dmask=0077 "$P_EFI" /mnt/boot
-    
     [[ -n "$SWAP_DEVICE" ]] && swapon "$SWAP_DEVICE"
 }
 
 install_packages() {
     log_info "Configuring Pacman..."
     sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
-    
-    log_info "Updating mirrors (Reflector)..."
     reflector --country Brazil --country 'United States' --protocol https --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
 
-    log_info "Bootstrapping system..."
-    
-    # Array Expansion handling
+    log_info "Bootstrapping..."
     FINAL_PKG_LIST=(
         "${PKGS_BASE[@]}" "$KERNEL_PKG" "$HEADER_PKG" ${UCODE_PKG:+"$UCODE_PKG"}
         "${PKGS_SYS[@]}" "${PKGS_SEC[@]}" "${PKGS_NET[@]}" "${PKGS_FS[@]}" 
         "${PKGS_AUDIO[@]}" "${PKGS_PRINT[@]}" "${PKGS_FONTS[@]}" 
         "${PKGS_APPS[@]}" "${DE_PKGS[@]}"
     )
-
-    if [[ "$OPT_HIBERNATE" != "y" ]]; then
-        FINAL_PKG_LIST+=("zram-generator")
-    fi
+    [[ "$OPT_HIBERNATE" != "y" ]] && FINAL_PKG_LIST+=("zram-generator")
 
     pacstrap -K /mnt "${FINAL_PKG_LIST[@]}"
-    
-    log_info "Generating Fstab..."
     genfstab -U /mnt >> /mnt/etc/fstab
     
-    # SECURITY FIX: Ensure fmask/dmask=0077 persists in fstab
-    log_info "Hardening Fstab permissions..."
+    # Permission hardening
     sed -i 's/fmask=0022/fmask=0077/g' /mnt/etc/fstab || true
     sed -i 's/dmask=0022/dmask=0077/g' /mnt/etc/fstab || true
-    # Fallback if genfstab used default vfat options
-    if ! grep -q "fmask=0077" /mnt/etc/fstab; then
-        sed -i 's/vfat\s*rw,/vfat    rw,fmask=0077,dmask=0077,/' /mnt/etc/fstab
-    fi
 }
 
 configure_target_system() {
-    log_info "Generating internal configuration script..."
+    log_info "Configuring internal system..."
     
     cat <<EOF > /mnt/setup_internal.sh
 #!/bin/bash
 set -euo pipefail
 
-# --- 1. LOCALIZATION ---
+# Locale/Time
 ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
 echo "$LOCALE UTF-8" > /etc/locale.gen; locale-gen
@@ -308,48 +260,38 @@ HOSTS
 
 sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
 
-# --- 2. USER & SECURITY ---
+# Users
 useradd -m -G wheel,video,input,storage -s /bin/bash "$USER_NAME"
 echo "$USER_NAME:$USER_PASS" | chpasswd
 echo "root:$USER_PASS" | chpasswd
-
-# Sudoers Drop-in (Best Practice)
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
 
-# --- 3. GAMING ---
+# Gaming
 if [ "$OPT_GAME" == "y" ]; then
-    echo "Configuring Gaming Stack..."
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy --noconfirm
-    # Installs explicit drivers detected from the outside variable
     pacman -S --noconfirm ${PKGS_GAME_TOOLS[@]} ${GPU_PKGS[@]}
 fi
 
-# --- 4. SWAY CONFIG ---
+# Sway
 if [[ "$DE_NAME" == "sway" ]]; then
     mkdir -p /home/$USER_NAME/.config/sway
     [ ! -f /home/$USER_NAME/.config/sway/config ] && cp /etc/sway/config /home/$USER_NAME/.config/sway/config
-    
-    # Ensure Autostart for Polkit/Network
     if ! grep -q "polkit-gnome" /home/$USER_NAME/.config/sway/config; then
-        echo -e "\n# --- Custom Autostart ---" >> /home/$USER_NAME/.config/sway/config
-        echo "exec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1" >> /home/$USER_NAME/.config/sway/config
+        echo -e "\nexec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1" >> /home/$USER_NAME/.config/sway/config
         echo "exec nm-applet --indicator" >> /home/$USER_NAME/.config/sway/config
     fi
     chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
 fi
 
-# --- 5. BOOTLOADER & HARDENING ---
+# Bootloader
 bootctl install
 UUID_CRYPT=\$(blkid -s UUID -o value $P_ROOT)
-
-# SECURITY: AppArmor enabled, Audit on, Lockdown mode
 SEC_PARAMS="lsm=landlock,lockdown,yama,integrity,apparmor,bpf audit=1 apparmor=1 security=apparmor"
 
-# HOOKS: systemd based (sd-encrypt/sd-lvm2)
-# FIX: 'sd-lvm2' must be AFTER 'sd-encrypt'
-HOOKS="systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt sd-lvm2"
+# HOOK FIX: lvm2 replaced sd-lvm2
+HOOKS="systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt lvm2"
 
 if [ "$OPT_HIBERNATE" == "y" ]; then
     sed -i "s/^HOOKS=.*/HOOKS=(\$HOOKS resume filesystems fsck)/" /etc/mkinitcpio.conf
@@ -357,8 +299,6 @@ if [ "$OPT_HIBERNATE" == "y" ]; then
 else
     sed -i "s/^HOOKS=.*/HOOKS=(\$HOOKS filesystems fsck)/" /etc/mkinitcpio.conf
     CMDLINE="rd.luks.name=\$UUID_CRYPT=cryptroot root=/dev/mapper/vg0-root rw quiet splash \$SEC_PARAMS"
-    
-    # ZRAM Config
     echo -e "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd" > /etc/systemd/zram-generator.conf
 fi
 
@@ -382,20 +322,19 @@ initrd  $INITRAMFS
 options \$CMDLINE
 LENTRY
 
-# --- 6. ENABLE SERVICES ---
+# Services
 systemctl enable NetworkManager bluetooth chronyd firewalld fstrim.timer pcscd cups apparmor $DM
 echo "vm.swappiness=10" > /etc/sysctl.d/99-ssd.conf
 
 EOF
 
     chmod +x /mnt/setup_internal.sh
-    log_info "Executing chroot configuration..."
+    log_info "Running chroot setup..."
     arch-chroot /mnt /setup_internal.sh
     rm /mnt/setup_internal.sh
 }
 
-# --- MAIN EXECUTION ---
-
+# --- MAIN ---
 pre_flight_checks
 detect_cpu_microcode
 collect_user_input
@@ -404,9 +343,4 @@ install_packages
 configure_target_system
 
 echo ""
-log_info "=================================================="
-log_info " INSTALLATION COMPLETED SUCCESSFULLY"
-log_info "=================================================="
-log_info " 1. Type 'reboot' to restart."
-log_info " 2. SECURE BOOT: Enroll keys with 'sbctl' manually."
-log_info "=================================================="
+log_info "DONE. Type 'reboot'."
