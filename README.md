@@ -13,7 +13,7 @@ Welcome to the Arch Linux Installation and Sway Dotfiles repository! This reposi
 1. Boot into the Arch Linux live environment.
 2. Run the installation script:
    ```bash
-   bash <(curl -s https://raw.githubusercontent.com/rogeriosobrinho/dell-xps-13-9315-arch-setup/main/arch/install.sh)
+   bash <(curl -s https://raw.githubusercontent.com/rogeriosobrinho/my-arch-setup/main/arch/install.sh)
 
 Follow the on-screen instructions to complete the installation process.
 
