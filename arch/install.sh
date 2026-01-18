@@ -1,342 +1,395 @@
-#!/usr/bin/env -S bash -e
-clear
+#!/usr/bin/env bash
+# ==============================================================================
+# PROJECT:      Arch Linux Automated Installer
+# VERSION:      1.2.0
+# TARGET:       Workstation (Laptop/Desktop) & Gaming
+# AUTHOR:       Rogerio Sobrinho (Gemini review)
+# ==============================================================================
 
-# Updating the live environment usually causes more problems than its worth, and quite often can't be done without remounting cowspace with more capacity, especially at the end of any given month.
-pacman -Sy
+# --- STRICT MODE ---
+set -euo pipefail
+IFS=$'\n\t'
 
-# Installing curl
-pacman -S --noconfirm curl git
+# --- LOGGING INFRASTRUCTURE ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Target for the installation.
+log_info()  { echo -e "${BLUE}[$(date +'%H:%M:%S')] [INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[$(date +'%H:%M:%S')] [WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[$(date +'%H:%M:%S')] [ERROR]${NC} $1" >&2; exit 1; }
 
-DISK=/dev/nvme0n1
-echo "Installing Arch Linux on $DISK."
+# Error trap with line reporting
+error_handler() {
+    local line_no=$1
+    log_error "Script failed at line $line_no. Installation aborted."
+}
+trap 'error_handler $LINENO' ERR
 
-# Setting username.
+# --- CONFIGURATION DEFAULTS ---
+LOCALE="en_US.UTF-8"
+KEYMAP="us-acentos"
+TIMEZONE="America/Sao_Paulo"
+HOSTNAME_DEFAULT="archlinux"
 
-read -r -p "Please enter name for a user account (leave empty to skip): " username
+# --- PACKAGE LISTS ---
 
-# Setting password.
+# 1. System Core (Hardware support + LVM)
+PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware)
 
-if [[ -n $username ]]; then
-    read -r -p "Please enter a password for the user account: " password
-fi
+# 2. System Utilities (Clean CLI stack)
+PKGS_SYS=(sudo neovim git man-db pacman-contrib unzip p7zip bat eza btop reflector usbutils ripgrep fd)
 
-# Deleting old partition scheme.
+# 3. Security & Identity (AppArmor + YubiKey)
+PKGS_SEC=(pcsclite ccid yubikey-manager bitwarden apparmor)
 
-wipefs -af "$DISK" &>/dev/null
-sgdisk -Zo "$DISK" &>/dev/null
+# 4. Networking
+PKGS_NET=(networkmanager chrony firewalld bluez bluez-utils)
 
-# Creating a new partition scheme.
+# 5. Filesystem Support
+PKGS_FS=(efibootmgr cryptsetup dosfstools e2fsprogs ntfs-3g)
 
-echo "Creating new partition scheme on $DISK."
-parted -s "$DISK" \
-    mklabel gpt \
-    mkpart ESP fat32 1MiB 512MiB \
-    set 1 esp on \
-    mkpart cryptroot 512MiB 100% \
+# 6. Audio Stack (Pipewire)
+PKGS_AUDIO=(pipewire pipewire-alsa pipewire-pulse wireplumber alsa-firmware)
 
-sleep 0.1
-ESP="/dev/$(lsblk $DISK -o NAME,PARTLABEL | grep ESP| cut -d " " -f1 | cut -c7-)"
-cryptroot="/dev/$(lsblk $DISK -o NAME,PARTLABEL | grep cryptroot | cut -d " " -f1 | cut -c7-)"
+# 7. Printing
+PKGS_PRINT=(cups)
 
-# Informing the Kernel of the changes.
+# 8. Fonts (Optimized for Dev/Productivity - No Bloat)
+# Using official repo packages instead of manual unzipping.
+PKGS_FONTS=(
+    noto-fonts                  # Fallback
+    noto-fonts-emoji            # Emoji support
+    ttf-liberation              # Metric-compatible with Arial/Times
+    
+    # Top Tier Dev Fonts (Nerd Patched)
+    ttf-jetbrains-mono-nerd     # The standard for IDEs
+    ttf-cascadia-code-nerd      # Microsoft's modern font (Great ligatures)
+    ttf-hack-nerd               # Classic terminal font
+    ttf-firacode-nerd           # Excellent ligatures
 
-echo "Informing the Kernel about the disk changes."
-partprobe "$DISK"
+    # Secondary options (Uncomment if strictly necessary to avoid bloat)
+    # ttf-meslo-nerd
+    # ttf-inconsolata-nerd
+    # ttf-mononoki-nerd
+    # ttf-roboto-mono-nerd
+    # ttf-sourcecodepro-nerd
+    # ttf-ubuntu-nerd
+)
 
-# Formatting the ESP as FAT32.
+# 9. Applications
+PKGS_APPS=(firefox thunderbird)
 
-echo "Formatting the EFI Partition as FAT32."
-mkfs.fat -F 32 -s 2 $ESP &>/dev/null
+# 10. Desktop Environments (Clean Profiles)
+PKGS_SWAY=(
+    sway swaybg swayidle swaylock waybar wofi mako ly 
+    polkit-gnome thunar gvfs 
+    wezterm grim slurp wl-clipboard brightnessctl pavucontrol network-manager-applet 
+    xdg-desktop-portal-wlr
+)
+PKGS_GNOME=(gnome-shell gdm gnome-console nautilus xdg-desktop-portal-gnome gnome-control-center)
+PKGS_KDE=(plasma-desktop sddm dolphin konsole xdg-desktop-portal-kde ark spectacle)
 
-# Creating a LUKS Container for the root partition.
+# 11. Gaming Tools (Optional Profile)
+PKGS_GAME_TOOLS=(steam lutris gamemode mangohud wine-staging winetricks)
 
-echo "Creating LUKS Container for the root partition."
-cryptsetup luksFormat $cryptroot
-echo "Opening the newly created LUKS Container."
-cryptsetup luksOpen $cryptroot cryptroot
-EXT4="/dev/mapper/cryptroot"
+# --- HARDWARE DETECTION ---
 
-# Create encrypted partitions - Encrypted Linux (Root + Home) & Swap partitions
+detect_cpu_microcode() {
+    log_info "Detecting CPU Vendor..."
+    local cpu_vendor
+    cpu_vendor=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
+    
+    if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
+        log_info "Intel CPU detected. Staging intel-ucode."
+        UCODE_PKG="intel-ucode"
+        UCODE_IMG="/intel-ucode.img"
+    elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+        log_info "AMD CPU detected. Staging amd-ucode."
+        UCODE_PKG="amd-ucode"
+        UCODE_IMG="/amd-ucode.img"
+    else
+        log_warn "Unknown CPU vendor. Skipping microcode."
+        UCODE_PKG=""
+        UCODE_IMG=""
+    fi
+}
 
-pvcreate $EXT4
-vgcreate vg0 $EXT4
-lvcreate -L 200G -n root vg0
-lvcreate -L 32G -n swap vg0
-lvcreate -l 100%FREE -n home vg0
+detect_gpu_drivers() {
+    log_info "Scanning PCI bus for GPUs..."
+    GPU_PKGS=()
+    
+    if lspci -k | grep -iq "NVIDIA"; then
+        log_info "NVIDIA GPU detected. Adding proprietary DKMS drivers."
+        GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils nvidia-settings)
+    elif lspci -k | grep -iq "AMD" && lspci -k | grep -E "(VGA|3D)" | grep -iq "AMD"; then
+        log_info "AMD GPU detected. Adding Mesa/Vulkan stack."
+        GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu)
+    elif lspci -k | grep -iq "Intel" && lspci -k | grep -E "(VGA|3D)" | grep -iq "Intel"; then
+        log_info "Intel GPU detected. Adding Mesa/Vulkan stack."
+        GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+    else
+        log_warn "No discrete GPU detected. Fallback to generic Mesa."
+        GPU_PKGS+=(mesa lib32-mesa)
+    fi
+}
 
-# Formatting the LUKS Container as EXT4.
+# --- PRE-FLIGHT CHECKS ---
 
-echo "Formatting the LUKS container as EXT4."
-mkfs.ext4 /dev/mapper/vg0-root &>/dev/null
-mkfs.ext4 /dev/mapper/vg0-home &>/dev/null
-mkswap /dev/mapper/vg0-swap &>/dev/null
+pre_flight_checks() {
+    [[ $EUID -ne 0 ]] && log_error "This script must be run as root."
+    [[ ! -d /sys/firmware/efi/efivars ]] && log_error "System is not booted in UEFI mode."
+    
+    if ! ping -c 1 archlinux.org &>/dev/null; then
+        log_error "No internet connection. Please connect via iwctl or ethernet."
+    fi
+}
 
-# Mounting the newly created subvolumes.
+# --- USER INPUT ---
 
-echo "Mounting volumes."
-mount /dev/mapper/vg0-root /mnt
-mkdir -p /mnt/{boot,home}
-mount /dev/mapper/vg0-home /mnt/home
-mount $ESP /mnt/boot
-swapon /dev/mapper/vg0-swap
+collect_user_input() {
+    clear
+    echo -e "${BLUE}=== ARCH LINUX INSTALLER V1.2 (GOLD MASTER) ===${NC}"
+    
+    # Hostname
+    read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_INPUT
+    HOSTNAME_VAL=${HOSTNAME_INPUT:-$HOSTNAME_DEFAULT}
 
-# Pacstrap (setting up a base sytem onto the new root).
+    # Disk
+    echo ""
+    lsblk -d -n -o NAME,SIZE,MODEL,TYPE | grep disk
+    echo ""
+    read -r -p "Target Disk (e.g., nvme0n1): " DISK
+    TARGET="/dev/$DISK"
+    
+    [[ ! -b "$TARGET" ]] && log_error "Invalid device: $TARGET"
+    
+    # NVMe vs SATA partition naming
+    if [[ "$DISK" =~ "nvme" ]]; then P_SUF="p"; else P_SUF=""; fi
+    P_EFI="${TARGET}${P_SUF}1"
+    P_ROOT="${TARGET}${P_SUF}2"
 
-echo "Installing the base system (it may take a while)."
-pacstrap -K /mnt base base-devel linux linux-firmware linux-headers sudo plymouth lvm2 efibootmgr intel-ucode mesa vim reflector mlocate man-db sof-firmware fwupd pcsc-tools grc unzip pacman-contrib rsync chrony networkmanager pcsclite ccid pcsc-tools apparmor firewalld flatpak sway swaybg swayidle swaylock waybar xdg-desktop-portal-wlr thunar thunar-archive-plugin thunar-volman xorg-xwayland dunst wezterm wofi pavucontrol brightnessctl playerctl slurp grim greetd network-manager-applet gnome-keyring blueberry git python-psutil python-notify2 blueman bluez bluez-utils gparted rsync ly qt5-wayland lxappearance qt5ct polkit lxqt-policykit imv fastfetch wireplumber pipewire pipewire-jack pipewire-alsa pipewire-pulse xdg-desktop-portal galculator evince eog wget exa bat btop tree speedtest-cli net-tools waybar wofi firefox chromium bitwarden vlc unzip p7zip libreoffice-fresh thunderbird deluge ntfs-3g neovim python-pip jdk17-openjdk jre17-openjdk docker docker-compose veracrypt ttf-font-awesome ttf-caladea ttf-carlito ttf-dejavu ttf-liberation ttf-linux-libertine-g noto-fonts adobe-source-code-pro-fonts adobe-source-sans-pro-fonts adobe-source-serif-pro-fonts 
+    # Profiles
+    echo ""
+    read -r -p "Enable GAMER Profile (Zen Kernel + Drivers)? (y/N): " OPT_GAME
+    if [[ "$OPT_GAME" == "y" ]]; then
+        KERNEL_PKG="linux-zen"; HEADER_PKG="linux-zen-headers"
+        VMLINUZ="/vmlinuz-linux-zen"; INITRAMFS="/initramfs-linux-zen.img"
+        detect_gpu_drivers
+    else
+        KERNEL_PKG="linux"; HEADER_PKG="linux-headers"
+        VMLINUZ="/vmlinuz-linux"; INITRAMFS="/initramfs-linux.img"
+        GPU_PKGS=()
+    fi
 
-# Generating /etc/fstab.
+    echo ""; read -r -p "Enable Hibernation (Physical Swap)? (y/N): " OPT_HIBERNATE
 
-echo "Generating a new fstab."
-genfstab -U /mnt >> /mnt/etc/fstab
+    # Desktop Environment
+    echo ""; echo "Select Desktop Environment:"
+    select opt in "Sway" "Gnome" "KDE"; do
+        case $opt in
+            "Sway") DE_PKGS=("${PKGS_SWAY[@]}"); DM="ly"; DE_NAME="sway"; break ;;
+            "Gnome") DE_PKGS=("${PKGS_GNOME[@]}"); DM="gdm"; DE_NAME="gnome"; break ;;
+            "KDE") DE_PKGS=("${PKGS_KDE[@]}"); DM="sddm"; DE_NAME="kde"; break ;;
+            *) log_warn "Invalid option." ;;
+        esac
+    done
 
-# Setting hostname.
+    # Credentials
+    echo ""; read -r -p "New Username: " USER_NAME
+    read -r -s -p "Password: " USER_PASS; echo ""
+}
 
-hostname=xps
-echo "$hostname" > /mnt/etc/hostname
+# --- INSTALLATION ROUTINE ---
 
-# Setting hosts file.
+prepare_storage() {
+    log_info "Wiping filesystem signatures on $TARGET..."
+    wipefs -af "$TARGET"
+    sgdisk -Zo "$TARGET"
+    
+    log_info "Partitioning (GPT)..."
+    parted -s "$TARGET" mklabel gpt \
+        mkpart ESP fat32 1MiB 512MiB set 1 esp on \
+        mkpart cryptroot 512MiB 100%
+    partprobe "$TARGET" && sleep 2
 
-echo "Setting hosts file."
-cat > /mnt/etc/hosts <<EOF
+    log_info "Encrypting (LUKS2 + Argon2id)..."
+    # Optimization: 4k sector size, disable workqueues for NVMe performance
+    cryptsetup luksFormat --type luks2 --sector-size 4096 --verify-passphrase "$P_ROOT"
+    cryptsetup open "$P_ROOT" cryptroot \
+        --perf-no_read_workqueue --perf-no_write_workqueue --allow-discards
+
+    log_info "Configuring LVM..."
+    pvcreate /dev/mapper/cryptroot
+    vgcreate vg0 /dev/mapper/cryptroot
+
+    if [[ "$OPT_HIBERNATE" == "y" ]]; then
+        log_info "Allocating Swap (34GB)..."
+        lvcreate -L 34G -n swap vg0; mkswap -L swap /dev/mapper/vg0-swap
+        SWAP_DEVICE="/dev/mapper/vg0-swap"
+    else
+        SWAP_DEVICE=""
+    fi
+
+    log_info "Allocating Root..."
+    lvcreate -l 100%FREE -n root vg0
+    mkfs.ext4 -L arch_root /dev/mapper/vg0-root
+    mkfs.fat -F 32 -n EFI "$P_EFI"
+
+    log_info "Mounting volumes..."
+    mount /dev/mapper/vg0-root /mnt
+    mkdir -p /mnt/boot
+    mount "$P_EFI" /mnt/boot
+    [[ -n "$SWAP_DEVICE" ]] && swapon "$SWAP_DEVICE"
+}
+
+install_packages() {
+    log_info "Configuring Pacman..."
+    sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
+    
+    log_info "Updating mirrors (Reflector)..."
+    reflector --country Brazil --country 'United States' --protocol https --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
+
+    log_info "Bootstrapping system..."
+    
+    # Array Expansion handling
+    FINAL_PKG_LIST=(
+        "${PKGS_BASE[@]}" "$KERNEL_PKG" "$HEADER_PKG" ${UCODE_PKG:+"$UCODE_PKG"}
+        "${PKGS_SYS[@]}" "${PKGS_SEC[@]}" "${PKGS_NET[@]}" "${PKGS_FS[@]}" 
+        "${PKGS_AUDIO[@]}" "${PKGS_PRINT[@]}" "${PKGS_FONTS[@]}" 
+        "${PKGS_APPS[@]}" "${DE_PKGS[@]}"
+    )
+
+    if [[ "$OPT_HIBERNATE" != "y" ]]; then
+        FINAL_PKG_LIST+=("zram-generator")
+    fi
+
+    pacstrap -K /mnt "${FINAL_PKG_LIST[@]}"
+    genfstab -U /mnt >> /mnt/etc/fstab
+}
+
+configure_target_system() {
+    log_info "Generating internal configuration script..."
+    
+    cat <<EOF > /mnt/setup_internal.sh
+#!/bin/bash
+set -euo pipefail
+
+# --- 1. LOCALIZATION ---
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc
+echo "$LOCALE UTF-8" > /etc/locale.gen; locale-gen
+echo "LANG=$LOCALE" > /etc/locale.conf
+echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+echo "$HOSTNAME_VAL" > /etc/hostname
+
+cat > /etc/hosts <<HOSTS
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   $hostname.localdomain   $hostname
-EOF
+127.0.1.1   $HOSTNAME_VAL.localdomain $HOSTNAME_VAL
+HOSTS
 
-# Setting up locales.
+sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
 
-echo "en_US.UTF-8 UTF-8"  > /mnt/etc/locale.gen
-echo "LANG=en_US.UTF-8" > /mnt/etc/locale.conf
+# --- 2. USER & SECURITY ---
+useradd -m -G wheel,video,input,storage -s /bin/bash "$USER_NAME"
+echo "$USER_NAME:$USER_PASS" | chpasswd
+echo "root:$USER_PASS" | chpasswd
 
-# Setting up keyboard layout.
+# Sudoers Drop-in (Best Practice)
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
+chmod 0440 /etc/sudoers.d/wheel
 
-echo "KEYMAP=us-acentos" > /mnt/etc/vconsole.conf
+# --- 3. GAMING ---
+if [ "$OPT_GAME" == "y" ]; then
+    echo "Configuring Gaming Stack..."
+    sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
+    pacman -Sy --noconfirm
+    pacman -S --noconfirm ${PKGS_GAME_TOOLS[@]} ${GPU_PKGS[@]}
+fi
 
-# Configuring /etc/mkinitcpio.conf
-
-echo "Configuring /etc/mkinitcpio for ZSTD compression and LUKS hook."
-sed -i 's,MODULES=(),MODULES=(ext4),g' /mnt/etc/mkinitcpio.conf
-sed -i 's,block,plymouth block encrypt lvm2 resume ,g' /mnt/etc/mkinitcpio.conf
-
-# Enabling CPU Mitigations
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/default/grub.d/40_cpu_mitigations.cfg -o /mnt/etc/grub.d/40_cpu_mitigations.cfg
-
-# Distrusting the CPU
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/default/grub.d/40_distrust_cpu.cfg -o /mnt/etc/grub.d/40_distrust_cpu.cfg
-
-# Enabling IOMMU
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/default/grub.d/40_enable_iommu.cfg -o /mnt/etc/grub.d/40_enable_iommu.cfg
-
-# Enabling NTS
-
-curl https://raw.githubusercontent.com/GrapheneOS/infrastructure/main/chrony.conf >> /mnt/etc/chrony.conf
-
-# Configure AppArmor Parser caching
-
-sed -i 's/#write-cache/write-cache/g' /mnt/etc/apparmor/parser.conf
-sed -i 's,#Include /etc/apparmor.d/,Include /etc/apparmor.d/,g' /mnt/etc/apparmor/parser.conf
-
-# Blacklisting kernel modules
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/modprobe.d/30_security-misc.conf -o /mnt/etc/modprobe.d/30_security-misc.conf
-chmod 600 /mnt/etc/modprobe.d/*
-
-# Security kernel settings.
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/usr/lib/sysctl.d/990-security-misc.conf -o /mnt/etc/sysctl.d/990-security-misc.conf
-sed -i 's/kernel.yama.ptrace_scope=2/kernel.yama.ptrace_scope=3/g' /mnt/etc/sysctl.d/990-security-misc.conf
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/sysctl.d/30_silent-kernel-printk.conf -o /mnt/etc/sysctl.d/30_silent-kernel-printk.conf
-curl https://raw.githubusercontent.com/Kicksecure/security-misc/master/etc/sysctl.d/30_security-misc_kexec-disable.conf -o /mnt/etc/sysctl.d/30_security-misc_kexec-disable.conf
-chmod 600 /mnt/etc/sysctl.d/*
-
-# Remove nullok from system-auth
-
-sed -i 's/nullok//g' /mnt/etc/pam.d/system-auth
-
-# Disable coredump
-
-echo "* hard core 0" >> /mnt/etc/security/limits.conf
-
-# Disable su for non-wheel users
-
-bash -c 'cat > /mnt/etc/pam.d/su' <<-'EOF'
-#%PAM-1.0
-auth		sufficient	pam_rootok.so
-# Uncomment the following line to implicitly trust users in the "wheel" group.
-#auth		sufficient	pam_wheel.so trust use_uid
-# Uncomment the following line to require a user to be in the "wheel" group.
-auth		required	pam_wheel.so use_uid
-auth		required	pam_unix.so
-account		required	pam_unix.so
-session		required	pam_unix.so
-EOF
-
-# Randomize Mac Address.
-
-bash -c 'cat > /mnt/etc/NetworkManager/conf.d/00-macrandomize.conf' <<-'EOF'
-[device]
-wifi.scan-rand-mac-address=yes
-[connection]
-wifi.cloned-mac-address=random
-ethernet.cloned-mac-address=random
-connection.stable-id=${CONNECTION}/${BOOT}
-EOF
-
-chmod 600 /mnt/etc/NetworkManager/conf.d/00-macrandomize.conf
-
-# Enable IPv6 privacy extensions
-
-bash -c 'cat > /mnt/etc/NetworkManager/conf.d/ip6-privacy.conf' <<-'EOF'
-[connection]
-ipv6.ip6-privacy=2
-EOF
-
-chmod 600 /mnt/etc/NetworkManager/conf.d/ip6-privacy.conf
-
-# Configuring the system.
-
-arch-chroot /mnt /bin/bash -e <<-EOF
-
-    # Setting up timezone.
-    ln -sf /usr/share/zoneinfo/$(curl -s http://ip-api.com/line?fields=timezone) /etc/localtime &>/dev/null
-
-    # Setting up clock.
-    hwclock --systohc
-
-    # Generating locales.my keys aren't even on
-    echo "Generating locales."
-    locale-gen &>/dev/null
-
-    # Generating a new initramfs.
-    echo "Creating a new initramfs."
-    chmod 600 /boot/initramfs-linux* &>/dev/null
-    mkinitcpio -p linux &>/dev/null
-
-    # Install systemd-boot
-    echo "Install systemd-boot."
-    bootctl install --path=/boot &>/dev/null
-
-    # Adding user with sudo privilege
-    if [ -n "$username" ]; then
-        echo "Adding $username with root privilege."
-        useradd -m $username
-        usermod -aG wheel $username
-
-        groupadd -r audit
-        gpasswd -a $username audit
+# --- 4. SWAY CONFIG ---
+if [[ "$DE_NAME" == "sway" ]]; then
+    mkdir -p /home/$USER_NAME/.config/sway
+    [ ! -f /home/$USER_NAME/.config/sway/config ] && cp /etc/sway/config /home/$USER_NAME/.config/sway/config
+    
+    # Ensure Autostart for Polkit/Network
+    if ! grep -q "polkit-gnome" /home/$USER_NAME/.config/sway/config; then
+        echo -e "\n# --- Custom Autostart ---" >> /home/$USER_NAME/.config/sway/config
+        echo "exec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1" >> /home/$USER_NAME/.config/sway/config
+        echo "exec nm-applet --indicator" >> /home/$USER_NAME/.config/sway/config
     fi
+    chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
+fi
+
+# --- 5. BOOTLOADER & HARDENING ---
+bootctl install
+UUID_CRYPT=\$(blkid -s UUID -o value $P_ROOT)
+
+# SECURITY: AppArmor enabled, Audit on, Lockdown mode
+SEC_PARAMS="lsm=landlock,lockdown,yama,integrity,apparmor,bpf audit=1 apparmor=1 security=apparmor"
+
+# HOOKS: systemd based (sd-encrypt/sd-lvm2)
+HOOKS="systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt sd-lvm2"
+
+if [ "$OPT_HIBERNATE" == "y" ]; then
+    sed -i "s/^HOOKS=.*/HOOKS=(\$HOOKS resume filesystems fsck)/" /etc/mkinitcpio.conf
+    CMDLINE="rd.luks.name=\$UUID_CRYPT=cryptroot root=/dev/mapper/vg0-root resume=/dev/mapper/vg0-swap rw quiet splash \$SEC_PARAMS"
+else
+    sed -i "s/^HOOKS=.*/HOOKS=(\$HOOKS filesystems fsck)/" /etc/mkinitcpio.conf
+    CMDLINE="rd.luks.name=\$UUID_CRYPT=cryptroot root=/dev/mapper/vg0-root rw quiet splash \$SEC_PARAMS"
+    
+    # ZRAM Config
+    echo -e "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd" > /etc/systemd/zram-generator.conf
+fi
+
+mkinitcpio -P
+
+cat > /boot/loader/loader.conf <<LCONF
+default arch.conf
+timeout 2
+console-mode max
+editor no
+LCONF
+
+INITRD_UCODE=""
+[ -n "$UCODE_IMG" ] && INITRD_UCODE="initrd $UCODE_IMG"
+
+cat > /boot/loader/entries/arch.conf <<LENTRY
+title   Arch Linux
+linux   $VMLINUZ
+\$INITRD_UCODE
+initrd  $INITRAMFS
+options \$CMDLINE
+LENTRY
+
+# --- 6. ENABLE SERVICES ---
+systemctl enable NetworkManager bluetooth chronyd firewalld fstrim.timer pcscd cups apparmor $DM
+echo "vm.swappiness=10" > /etc/sysctl.d/99-ssd.conf
+
 EOF
 
-cat > /mnt/boot/loader/loader.conf <<-EOF
-    default arch.conf
-    timeout 0
-    console-mode max
-    editor no
-EOF
+    chmod +x /mnt/setup_internal.sh
+    log_info "Executing chroot configuration..."
+    arch-chroot /mnt /setup_internal.sh
+    rm /mnt/setup_internal.sh
+}
 
-cat > /mnt/boot/loader/entries/arch.conf <<-EOF
-    title   Arch Linux
-    linux   /vmlinuz-linux
-    initrd  /intel-ucode.img
-    initrd  /initramfs-linux.img
-    options cryptdevice=$cryptroot:luks:allow-discards resume=/dev/mapper/vg0-swap root=/dev/mapper/vg0-root rw quiet splash lsm=landlock,lockdown,yama,integrity,apparmor,bpf
-EOF
+# --- MAIN EXECUTION ---
 
-# Enable AppArmor notifications
-# Must create ~/.config/autostart first
+pre_flight_checks
+detect_cpu_microcode
+collect_user_input
+prepare_storage
+install_packages
+configure_target_system
 
-mkdir -p -m 700 /mnt/home/${username}/.config/autostart/
-bash -c "cat > /mnt/home/${username}/.config/autostart/apparmor-notify.desktop" <<-'EOF'
-[Desktop Entry]
-Type=Application
-Name=AppArmor Notify
-Comment=Receive on screen notifications of AppArmor denials
-TryExec=aa-notify
-Exec=aa-notify -p -s 1 -w 60 -f /var/log/audit/audit.log
-StartupNotify=false
-NoDisplay=true
-EOF
-chmod 700 /mnt/home/${username}/.config/autostart/apparmor-notify.desktop
-arch-chroot /mnt chown -R $username:$username /home/${username}/.config
-
-# Settings swap
-
-echo "vm.swappiness=10" >> /mnt/etc/sysctl.conf
-
-#  Settings SSD/NVME
-echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf
-echo "vm.dirty_background_ratio = 5" >> /etc/sysctl.conf
-
-# Setting user password.
-
-[ -n "$username" ] && echo "Setting user password for ${username}." && echo -e "${password}\n${password}" | arch-chroot /mnt passwd "$username" &>/dev/null
-
-# Giving wheel user sudo access.
-
-sed -i 's/# \(%wheel ALL=(ALL\(:ALL\|\)) ALL\)/\1/g' /mnt/etc/sudoers
-
-# Change audit logging group
-
-echo "log_group = audit" >> /etc/audit/auditd.conf
-
-# Enabling audit service.
-
-systemctl enable auditd --root=/mnt &>/dev/null
-
-# Enabling auto-trimming service.
-
-systemctl enable fstrim.timer --root=/mnt &>/dev/null
-
-# Enabling NetworkManager.
-
-systemctl enable NetworkManager --root=/mnt &>/dev/null
-
-# Enabling ly
-
-systemctl enable ly.service --root=/mnt &>/dev/null
-
-# Enabling AppArmor.
-
-echo "Enabling AppArmor."
-systemctl enable apparmor --root=/mnt &>/dev/null
-
-# Enabling pcscd
-
-systemctl enable pcscd.service --root=/mnt &>/dev/null
-
-# Enabling paccache
-
-systemctl enable paccache.timer --root=/mnt &>/dev/null
-
-# Enabling Firewalld.
-echo "Enabling Firewalld."
-systemctl enable firewalld --root=/mnt &>/dev/null
-
-# Enabling Bluetooth Service (This is only to fix the visual glitch with gnome where it gets stuck in the menu at the top right).
-# IF YOU WANT TO USE BLUETOOTH, YOU MUST REMOVE IT FROM THE LIST OF BLACKLISTED KERNEL MODULES IN /mnt/etc/modprobe.d/30_security-misc.conf
-
-systemctl enable bluetooth --root=/mnt &>/dev/null
-
-# Enabling Reflector timer.
-
-echo "Enabling Reflector."
-systemctl enable reflector.timer --root=/mnt &>/dev/null
-
-# Enabling libvirt
-
-systemctl enable libvirtd.service --root=/mnt &>/dev/null
-systemctl enable virtlogd.service --root=/mnt &>/dev/null
-
-# Disabling systemd-timesyncd
-
-systemctl disable systemd-timesyncd --root=/mnt &>/dev/null
-
-# Enabling chronyd
-
-systemctl enable chronyd --root=/mnt &>/dev/null
-
-# Finishing up
-
-echo "Done, you may now wish to reboot (further changes can be done by chrooting into /mnt)."
-exit
+echo ""
+log_info "=================================================="
+log_info " INSTALLATION COMPLETED"
+log_info "=================================================="
+log_info " 1. Type 'reboot' to restart."
+log_info " 2. SECURE BOOT: Enroll keys with 'sbctl' manually."
+log_info "=================================================="
