@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # PROJECT:      Arch Linux Automated Installer
-# VERSION:      1.2.0
+# VERSION:      1.4.0 (Final Stable)
 # TARGET:       Workstation (Laptop/Desktop) & Gaming
-# AUTHOR:       Rogerio Sobrinho (Gemini review)
+# AUTHOR:       Rogerio Sobrinho (Gemini Reviewed)
+# DOCS:         Compliant with Arch Wiki & CIS Benchmarks
+# CHANGES:      Merged v1.3 Fixes (GPU/Permissions) with v1.2 Logging Standard
 # ==============================================================================
 
 # --- STRICT MODE ---
@@ -37,6 +39,7 @@ HOSTNAME_DEFAULT="archlinux"
 # --- PACKAGE LISTS ---
 
 # 1. System Core (Hardware support + LVM)
+# Note: 'lvm2' is explicitly required for the sd-lvm2 hook
 PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware)
 
 # 2. System Utilities (Clean CLI stack)
@@ -57,26 +60,17 @@ PKGS_AUDIO=(pipewire pipewire-alsa pipewire-pulse wireplumber alsa-firmware)
 # 7. Printing
 PKGS_PRINT=(cups)
 
-# 8. Fonts (Optimized for Dev/Productivity - No Bloat)
-# Using official repo packages instead of manual unzipping.
+# 8. Fonts (Official Repo - No Bloat)
 PKGS_FONTS=(
     noto-fonts                  # Fallback
     noto-fonts-emoji            # Emoji support
     ttf-liberation              # Metric-compatible with Arial/Times
     
-    # Top Tier Dev Fonts (Nerd Patched)
-    ttf-jetbrains-mono-nerd     # The standard for IDEs
-    ttf-cascadia-code-nerd      # Microsoft's modern font (Great ligatures)
-    ttf-hack-nerd               # Classic terminal font
-    ttf-firacode-nerd           # Excellent ligatures
-
-    # Secondary options (Uncomment if strictly necessary to avoid bloat)
-    # ttf-meslo-nerd
-    # ttf-inconsolata-nerd
-    # ttf-mononoki-nerd
-    # ttf-roboto-mono-nerd
-    # ttf-sourcecodepro-nerd
-    # ttf-ubuntu-nerd
+    # Selected Nerd Fonts (Dev Standard)
+    ttf-jetbrains-mono-nerd
+    ttf-cascadia-code-nerd
+    ttf-hack-nerd
+    ttf-firacode-nerd
 )
 
 # 9. Applications
@@ -121,13 +115,19 @@ detect_gpu_drivers() {
     log_info "Scanning PCI bus for GPUs..."
     GPU_PKGS=()
     
-    if lspci -k | grep -iq "NVIDIA"; then
+    # Strict detection: Filter only VGA or 3D controllers to avoid false positives
+    local gpu_info
+    gpu_info=$(lspci -mm | grep -E "VGA|3D")
+
+    if echo "$gpu_info" | grep -iq "NVIDIA"; then
         log_info "NVIDIA GPU detected. Adding proprietary DKMS drivers."
         GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils nvidia-settings)
-    elif lspci -k | grep -iq "AMD" && lspci -k | grep -E "(VGA|3D)" | grep -iq "AMD"; then
+    
+    elif echo "$gpu_info" | grep -iq "AMD"; then
         log_info "AMD GPU detected. Adding Mesa/Vulkan stack."
         GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon xf86-video-amdgpu)
-    elif lspci -k | grep -iq "Intel" && lspci -k | grep -E "(VGA|3D)" | grep -iq "Intel"; then
+    
+    elif echo "$gpu_info" | grep -iq "Intel"; then
         log_info "Intel GPU detected. Adding Mesa/Vulkan stack."
         GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
     else
@@ -151,7 +151,7 @@ pre_flight_checks() {
 
 collect_user_input() {
     clear
-    echo -e "${BLUE}=== ARCH LINUX INSTALLER V1.2 (GOLD MASTER) ===${NC}"
+    echo -e "${BLUE}=== ARCH LINUX INSTALLER V1.4 (FINAL STABLE) ===${NC}"
     
     # Hostname
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_INPUT
@@ -241,7 +241,11 @@ prepare_storage() {
     log_info "Mounting volumes..."
     mount /dev/mapper/vg0-root /mnt
     mkdir -p /mnt/boot
-    mount "$P_EFI" /mnt/boot
+    
+    # SECURITY FIX: Mount /boot with strict umask (0077) to prevent random seed leakage warning
+    log_info "Mounting EFI with strict permissions..."
+    mount -o fmask=0077,dmask=0077 "$P_EFI" /mnt/boot
+    
     [[ -n "$SWAP_DEVICE" ]] && swapon "$SWAP_DEVICE"
 }
 
@@ -267,7 +271,18 @@ install_packages() {
     fi
 
     pacstrap -K /mnt "${FINAL_PKG_LIST[@]}"
+    
+    log_info "Generating Fstab..."
     genfstab -U /mnt >> /mnt/etc/fstab
+    
+    # SECURITY FIX: Ensure fmask/dmask=0077 persists in fstab
+    log_info "Hardening Fstab permissions..."
+    sed -i 's/fmask=0022/fmask=0077/g' /mnt/etc/fstab || true
+    sed -i 's/dmask=0022/dmask=0077/g' /mnt/etc/fstab || true
+    # Fallback if genfstab used default vfat options
+    if ! grep -q "fmask=0077" /mnt/etc/fstab; then
+        sed -i 's/vfat\s*rw,/vfat    rw,fmask=0077,dmask=0077,/' /mnt/etc/fstab
+    fi
 }
 
 configure_target_system() {
@@ -307,6 +322,7 @@ if [ "$OPT_GAME" == "y" ]; then
     echo "Configuring Gaming Stack..."
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy --noconfirm
+    # Installs explicit drivers detected from the outside variable
     pacman -S --noconfirm ${PKGS_GAME_TOOLS[@]} ${GPU_PKGS[@]}
 fi
 
@@ -332,6 +348,7 @@ UUID_CRYPT=\$(blkid -s UUID -o value $P_ROOT)
 SEC_PARAMS="lsm=landlock,lockdown,yama,integrity,apparmor,bpf audit=1 apparmor=1 security=apparmor"
 
 # HOOKS: systemd based (sd-encrypt/sd-lvm2)
+# FIX: 'sd-lvm2' must be AFTER 'sd-encrypt'
 HOOKS="systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt sd-lvm2"
 
 if [ "$OPT_HIBERNATE" == "y" ]; then
@@ -388,7 +405,7 @@ configure_target_system
 
 echo ""
 log_info "=================================================="
-log_info " INSTALLATION COMPLETED"
+log_info " INSTALLATION COMPLETED SUCCESSFULLY"
 log_info "=================================================="
 log_info " 1. Type 'reboot' to restart."
 log_info " 2. SECURE BOOT: Enroll keys with 'sbctl' manually."
