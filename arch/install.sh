@@ -284,7 +284,7 @@ systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 
 if [[ "$DM" == "ly" ]]; then
     systemctl disable getty@tty2.service
-    systemctl enable ly.service
+    systemctl enable ly@ttyX.service
 else
     systemctl enable "$DM"
 fi
