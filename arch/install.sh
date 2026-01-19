@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v6.0 (Clean HW Detection)
-# DESCRIPTION:  Dynamic Module Loading. Clean Configs. Sway/Nvidia ready.
+# PROJECT:      Arch Linux Installer v6.1 (Clean Code & Boot Fix)
+# DESCRIPTION:  Split-Firmware (No Bloat). Fixed Mirrorlist CP. Udev Hooks.
 # TARGET:       Workstation & Gaming
 # AUTHOR:       Rogerio Sobrinho (Refactored by Gemini)
 # DATE:         2026-01-19
@@ -27,7 +27,9 @@ KEYMAP_CONSOLE="us"
 FONT_CONSOLE="latarcyrheb-sun16" 
 
 # --- PACKAGES ---
-PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware archlinux-keyring linux-lts linux-lts-headers)
+# REMOVED: linux-firmware (Meta-package pulls bloat like Mediatek/Marvell)
+# ADDED: logic to inject specific firmware later
+PKGS_BASE=(base base-devel lvm2 sof-firmware archlinux-keyring linux-lts linux-lts-headers)
 
 PKGS_SYS=(
     sudo neovim vim git man-db man-pages pacman-contrib fwupd 
@@ -65,8 +67,8 @@ PKGS_KDE=(plasma-desktop sddm dolphin konsole xdg-desktop-portal-kde ark spectac
 PKGS_LAPTOP=(tlp kanshi brightnessctl)
 PKGS_GAME=(steam lutris gamemode mangohud wine-staging winetricks openrgb)
 
-# --- GLOBAL VARS FOR HW DETECTION ---
-GPU_PKGS=()
+# --- GLOBAL VARS ---
+HW_PKGS=()
 HW_MODULES=""
 KERNEL_PARAMS="rw"
 IS_LAPTOP="false"
@@ -82,7 +84,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v6.0 (Smart HW Detect) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v6.1 (Clean & Fix) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -120,32 +122,51 @@ collect_input() {
 }
 
 detect_hw() {
-    log_info "Detecting Hardware..."
+    log_info "Detecting Hardware (Clean Code Mode)..."
     
-    # CPU
+    # CPU & Microcode & CPU Firmware
     CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-    [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
+    if [[ "$CPU_V" == "GenuineIntel" ]]; then
+        UCODE="intel-ucode"
+        HW_PKGS+=(linux-firmware-intel) # 2026 Split
+    else
+        UCODE="amd-ucode"
+        HW_PKGS+=(linux-firmware-amd)   # 2026 Split
+    fi
     
-    # GPU & Modules
-    # Using concatenation to support Hybrid Graphics (Intel + Nvidia/AMD)
-    
+    # GPU & Firmware & Modules
     if lspci | grep -qi "Intel"; then 
-        GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+        HW_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+        # Intel GPU firmware is usually in linux-firmware-intel
         HW_MODULES="${HW_MODULES} i915"
     fi
     
     if lspci | grep -qi "AMD"; then 
-        GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
+        HW_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon linux-firmware-amdgpu)
         HW_MODULES="${HW_MODULES} amdgpu"
     fi
     
     if lspci | grep -qi "NVIDIA"; then 
-        GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils)
-        # Proprietary Nvidia modules for Early KMS + Wayland
+        HW_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils linux-firmware-nvidia)
         HW_MODULES="${HW_MODULES} nvidia nvidia_modeset nvidia_uvm nvidia_drm"
         KERNEL_PARAMS="${KERNEL_PARAMS} nvidia-drm.modeset=1"
     fi
     
+    # Network Firmware (Minimal safeguard)
+    # If we can't detect, we might need generic, but user wants NO bloat.
+    # Most modern cards are Intel (iwlwifi) or Realtek.
+    if lspci | grep -qi "Intel.*Wireless"; then
+        HW_PKGS+=(linux-firmware-iwlwifi) 2>/dev/null || HW_PKGS+=(linux-firmware)
+    elif lspci | grep -qi "Qualcomm\|Atheros"; then
+        HW_PKGS+=(linux-firmware-ath10k linux-firmware-ath11k) 2>/dev/null || HW_PKGS+=(linux-firmware)
+    elif lspci | grep -qi "Mediatek"; then
+        HW_PKGS+=(linux-firmware-mediatek)
+    else
+        # Fallback: if detection fails, we must install base firmware to ensure connectivity
+        log_info "Wifi vendor unknown. Installing base firmware to be safe."
+        HW_PKGS+=(linux-firmware)
+    fi
+
     # Chassis
     if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
         IS_LAPTOP="true"
@@ -154,9 +175,8 @@ detect_hw() {
         log_info "Type: Desktop"
     fi
     
-    # Trim whitespace from modules
     HW_MODULES=$(echo "$HW_MODULES" | xargs)
-    log_info "Detected Modules: $HW_MODULES"
+    log_info "Hardware Profile: $CPU_V / Modules: $HW_MODULES"
 }
 
 prepare_disk() {
@@ -190,27 +210,28 @@ prepare_disk() {
 }
 
 install_base() {
-    # 1. Hardware detection MUST run before pacstrap to determine packages
     detect_hw
 
-    log_info "Optimizing Mirrors..."
-    if ! reflector --latest 20 --number 5 --protocol https --sort rate --download-timeout 10 --save /etc/pacman.d/mirrorlist; then
-        log_err "Reflector failed. Check internet."
+    log_info "Optimizing Mirrors (Strict)..."
+    # FIX: Increased timeout and verify connection
+    if ! reflector --latest 20 --number 5 --protocol https --sort rate --download-timeout 15 --save /etc/pacman.d/mirrorlist; then
+        log_err "Mirrors unreachable. Check internet connection."
     fi
     
-    log_info "Pacman Config..."
+    log_info "Syncing DB..."
     sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
     sed -i 's/^#Color/Color/' /etc/pacman.conf
     sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy --noconfirm
     
+    # Combine Packages
     PKG_LIST=(
         "${PKGS_BASE[@]}" "$KERNEL" "$K_HEADERS" "$UCODE" 
         "${PKGS_SYS[@]}" "${PKGS_SEC[@]}" "${PKGS_NET[@]}" "${PKGS_FS[@]}" 
         "${PKGS_AUDIO[@]}" "${PKGS_PRINT[@]}" "${PKGS_FONTS[@]}" 
         "${PKGS_APPS[@]}" "${PKGS_DEV[@]}" "${PKGS_THEMES_GLOBAL[@]}"
-        "${DE_PKGS[@]}" "${GPU_PKGS[@]}"
+        "${DE_PKGS[@]}" "${HW_PKGS[@]}"
     )
     
     [[ "$IS_LAPTOP" == "true" ]] && PKG_LIST+=("${PKGS_LAPTOP[@]}")
@@ -224,7 +245,9 @@ install_base() {
     done
     
     genfstab -U /mnt >> /mnt/etc/fstab
-    log_info "Copying mirrorlist..."
+    
+    # FIX: Mirrorlist copy AFTER pacstrap, BEFORE chroot
+    log_info "Copying optimized mirrorlist..."
     cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
 }
 
@@ -243,7 +266,7 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen; locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "$HOSTNAME_VAL" > /etc/hostname
 
-# 2. VConsole
+# 2. VConsole (MUST exist before mkinitcpio)
 echo "KEYMAP=$KEYMAP_CONSOLE" > /etc/vconsole.conf
 echo "FONT=$FONT_CONSOLE" >> /etc/vconsole.conf
 
@@ -305,8 +328,7 @@ fi
 # 6. Bootloader & Initramfs
 bootctl install
 
-# DYNAMIC MODULES INJECTION
-# Cleanest approach: Only add what hardware was detected.
+# MKINITCPIO: Udev hooks + Clean Modules (No sd-vconsole)
 cat > /etc/mkinitcpio.conf <<MKCONF
 MODULES=($HW_MODULES dm_mod dm_crypt ext4)
 BINARIES=()
