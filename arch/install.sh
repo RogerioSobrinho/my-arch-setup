@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v5.4 (Stable/Udev/Ly-Template/Verbose)
-# DESCRIPTION:  Official Repos. Hooks: Udev. Ly: TTY Template. PkgList: On.
+# PROJECT:      Arch Linux Installer v5.6 (Global Mirrors)
+# DESCRIPTION:  Reflector: Top 5 Global/Rate. Retry Logic. Fixed Services.
 # TARGET:       Workstation & Gaming
 # AUTHOR:       Rogerio Sobrinho (Refactored by Gemini)
 # DATE:         2026-01-19
@@ -33,7 +33,7 @@ PKGS_SYS=(
     sudo neovim vim git man-db man-pages pacman-contrib fwupd 
     bash-completion fzf fastfetch trash-cli ripgrep fd jq
     htop ncdu plocate unzip p7zip unrar atool tree
-    rsync wget curl bind restic
+    rsync wget curl bind restic reflector
 )
 
 PKGS_SEC=(pcsclite ccid yubikey-manager bitwarden apparmor timeshift earlyoom)
@@ -75,7 +75,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v5.4 (Fixed) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v5.6 (Global Top 5) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -158,10 +158,14 @@ detect_hw() {
 }
 
 install_base() {
-    log_info "Pacman Config & Install..."
+    log_info "Optimizing Mirrors (Global Top 5)..."
+    # FIX: Get latest 20 synced mirrors worldwide, pick top 5 by speed
+    reflector --latest 20 --number 5 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+    
+    log_info "Pacman Config..."
     sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
     sed -i 's/^#Color/Color/' /etc/pacman.conf
-    sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf # Added
+    sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy
     
@@ -179,7 +183,18 @@ install_base() {
     [[ "$OPT_GAME" == "y" ]] && PKG_LIST+=("${PKGS_GAME[@]}")
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
-    pacstrap -K /mnt "${PKG_LIST[@]}"
+    log_info "Installing Packages (with Retry)..."
+    # FIX: Retry logic for unstable connections
+    for i in {1..3}; do
+        if pacstrap -K /mnt "${PKG_LIST[@]}"; then
+            break
+        else
+            log_info "Pacstrap failed. Retrying ($i/3)..."
+            sleep 3
+        fi
+        if [[ $i -eq 3 ]]; then log_err "Pacstrap failed after 3 attempts."; fi
+    done
+    
     genfstab -U /mnt >> /mnt/etc/fstab
 }
 
@@ -203,9 +218,12 @@ echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 echo "FONT=$FONT_CONSOLE" >> /etc/vconsole.conf
 
 # Repos & Users
+# FIX: Ensure target uses the same optimized mirrorlist
+cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+
 sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
 sed -i 's/^#Color/Color/' /etc/pacman.conf
-sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf # Added
+sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
 cat >> /etc/pacman.conf <<PAC
 [multilib]
 Include = /etc/pacman.d/mirrorlist
@@ -278,7 +296,7 @@ systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 
 if [[ "$DM" == "ly" ]]; then
     systemctl disable getty@tty2.service
-    systemctl enable ly@tty2.service
+    systemctl enable ly@ttyX.service
 else
     systemctl enable "$DM"
 fi
@@ -296,3 +314,4 @@ prepare_disk
 install_base
 config_system
 log_succ "DONE. Remove USB and Reboot."
+
