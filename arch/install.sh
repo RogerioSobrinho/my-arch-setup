@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v5.0 (Stable & Barebones)
-# DESCRIPTION:  Official Repos Only. No Mirror Optimization. No AUR.
+# PROJECT:      Arch Linux Installer v5.4 (Stable/Udev/Ly-Template/Verbose)
+# DESCRIPTION:  Official Repos. Hooks: Udev. Ly: TTY Template. PkgList: On.
 # TARGET:       Workstation & Gaming
-# AUTHOR:       Rogerio Sobrinho (Reviewed by Gemini AI)
-# DATE:         2026-01-18
+# AUTHOR:       Rogerio Sobrinho (Refactored by Gemini)
+# DATE:         2026-01-19
 # ==============================================================================
 
 set -euo pipefail
@@ -19,27 +19,21 @@ NC='\033[0m'
 log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 log_succ() { echo -e "${GREEN}[OK]${NC}   $1"; }
 log_err()  { echo -e "${RED}[ERR]${NC}  $1"; exit 1; }
-
-error_handler() {
-    log_err "Script failed at line $1. Check internet connection."
-}
-trap 'error_handler $LINENO' ERR
+trap 'log_err "Script failed at line $LINENO"' ERR
 
 # --- CONFIG ---
 HOSTNAME_DEFAULT="archlinux"
 KEYMAP="us-intl"
+FONT_CONSOLE="latarcyrheb-sun16" 
 
-# --- PACKAGES (Official Only) ---
-
+# --- PACKAGES ---
 PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware archlinux-keyring linux-lts linux-lts-headers)
 
 PKGS_SYS=(
     sudo neovim vim git man-db man-pages pacman-contrib fwupd 
     bash-completion fzf fastfetch trash-cli ripgrep fd jq
-    htop ncdu plocate
-    unzip p7zip unrar atool tree
-    rsync wget curl bind
-    restic
+    htop ncdu plocate unzip p7zip unrar atool tree
+    rsync wget curl bind restic
 )
 
 PKGS_SEC=(pcsclite ccid yubikey-manager bitwarden apparmor timeshift earlyoom)
@@ -52,7 +46,7 @@ PKGS_APPS=(firefox thunderbird flatpak)
 PKGS_DEV=(docker docker-compose docker-buildx)
 PKGS_THEMES_GLOBAL=(gnome-themes-extra adwaita-icon-theme glib2)
 
-# Sway Profile (All Official)
+# Sway Profile
 PKGS_SWAY=(
     sway swaybg swayidle swaylock dmenu ly foot 
     xdg-desktop-portal-wlr xdg-desktop-portal-gtk 
@@ -63,11 +57,11 @@ PKGS_SWAY=(
     mako grim slurp cliphist
     xorg-xwayland
     qt5-wayland qt6-wayland qt5ct qt6ct
+    gsettings-desktop-schemas
 )
 
 PKGS_GNOME=(gnome-shell gdm gnome-console nautilus xdg-desktop-portal-gnome gnome-control-center)
 PKGS_KDE=(plasma-desktop sddm dolphin konsole xdg-desktop-portal-kde ark spectacle)
-
 PKGS_LAPTOP=(tlp kanshi brightnessctl)
 PKGS_GAME=(steam lutris gamemode mangohud wine-staging winetricks openrgb)
 
@@ -81,7 +75,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v5.0 (No Mirrors/AUR) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v5.4 (Fixed) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -91,7 +85,7 @@ collect_input() {
     read -r -p "Target Disk (e.g., nvme0n1): " DISK
     TARGET="/dev/$DISK"
     
-    if [[ ! -b "$TARGET" ]]; then log_err "Invalid disk."; fi
+    [[ ! -b "$TARGET" ]] && log_err "Invalid disk."
     if [[ "$DISK" =~ "nvme" ]]; then P_SUF="p"; else P_SUF=""; fi
     P_EFI="${TARGET}${P_SUF}1"; P_ROOT="${TARGET}${P_SUF}2"
 
@@ -110,7 +104,7 @@ collect_input() {
             "Sway") DE_PKGS=("${PKGS_SWAY[@]}"); DM="ly"; DE_NAME="sway"; break ;;
             "Gnome") DE_PKGS=("${PKGS_GNOME[@]}"); DM="gdm"; DE_NAME="gnome"; break ;;
             "KDE") DE_PKGS=("${PKGS_KDE[@]}"); DM="sddm"; DE_NAME="kde"; break ;;
-            *) log_warn "Invalid selection." ;;
+            *) echo "Invalid." ;;
         esac
     done
 
@@ -127,17 +121,19 @@ prepare_disk() {
         mkpart cryptroot 512MiB 100%
     sleep 2
     
-    log_info "Encrypting..."
+    log_info "Encrypting (LUKS2)..."
     echo -n "$USER_PASS" | cryptsetup luksFormat --type luks2 --sector-size 4096 -d - "$P_ROOT"
     echo -n "$USER_PASS" | cryptsetup open -d - "$P_ROOT" cryptroot --perf-no_read_workqueue --perf-no_write_workqueue --allow-discards
 
     pvcreate /dev/mapper/cryptroot; vgcreate vg0 /dev/mapper/cryptroot
+    
     if [[ "$OPT_HIB" == "y" ]]; then
         lvcreate -L 34G -n swap vg0; mkswap /dev/mapper/vg0-swap
         SWAP_DEV="/dev/mapper/vg0-swap"
     else
         SWAP_DEV=""
     fi
+    
     lvcreate -l 100%FREE -n root vg0
     mkfs.ext4 /dev/mapper/vg0-root; mkfs.fat -F 32 -n EFI "$P_EFI"
 
@@ -147,7 +143,6 @@ prepare_disk() {
 }
 
 detect_hw() {
-    log_info "Detecting HW..."
     CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
     [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
     
@@ -159,26 +154,16 @@ detect_hw() {
     IS_LAPTOP="false"
     if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
         IS_LAPTOP="true"
-        log_info "Type: Laptop"
-    else
-        log_info "Type: Desktop"
     fi
 }
 
 install_base() {
-    log_info "Configuring Pacman..."
+    log_info "Pacman Config & Install..."
     sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
     sed -i 's/^#Color/Color/' /etc/pacman.conf
-    # Verbose disabled to avoid clutter on slow connections
-    # sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
-    
-    # Enable Multilib on ISO
-    log_info "Enabling Multilib on ISO..."
+    sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf # Added
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy
-
-    # SKIPPING REFLECTOR: Using default ISO mirrors to avoid bad mirrors
-    # reflector ...
     
     detect_hw
     
@@ -190,42 +175,42 @@ install_base() {
         "${DE_PKGS[@]}" "${GPU_PKGS[@]}"
     )
     
-    if [[ "$IS_LAPTOP" == "true" ]] && [[ "$DE_NAME" == "sway" ]]; then
-        PKG_LIST+=("${PKGS_LAPTOP[@]}")
-    elif [[ "$IS_LAPTOP" == "true" ]]; then
-        PKG_LIST+=("tlp")
-    fi
-    
+    [[ "$IS_LAPTOP" == "true" ]] && PKG_LIST+=("${PKGS_LAPTOP[@]}")
     [[ "$OPT_GAME" == "y" ]] && PKG_LIST+=("${PKGS_GAME[@]}")
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
-    log_info "Installing packages..."
-    if ! pacstrap -K /mnt "${PKG_LIST[@]}"; then
-        log_err "Pacstrap failed! Check your internet/mirrors."
-    fi
+    pacstrap -K /mnt "${PKG_LIST[@]}"
     genfstab -U /mnt >> /mnt/etc/fstab
 }
 
 config_system() {
-    log_info "System Config..."
+    log_info "Configuring System..."
+    LUKSUUID=$(blkid -s UUID -o value "$P_ROOT")
+
     cat <<EOF > /mnt/setup.sh
 #!/bin/bash
+set -e
+
+# Time & Locale
 ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
 hwclock --systohc
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen; locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 echo "$HOSTNAME_VAL" > /etc/hostname
 
-# Enable Multilib on Target
+# VConsole
+echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+echo "FONT=$FONT_CONSOLE" >> /etc/vconsole.conf
+
+# Repos & Users
+sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
+sed -i 's/^#Color/Color/' /etc/pacman.conf
+sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf # Added
 cat >> /etc/pacman.conf <<PAC
 [multilib]
 Include = /etc/pacman.d/mirrorlist
 PAC
 pacman -Sy
-
-sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
-sed -i 's/^#Color/Color/' /etc/pacman.conf
 
 useradd -m -G wheel,video,storage,docker -s /bin/bash "$USER_NAME"
 echo "$USER_NAME:$USER_PASS" | chpasswd
@@ -234,7 +219,12 @@ echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 
 flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
-# --- DE Specific Configuration ---
+# ZRAM Config
+if pacman -Q zram-generator &>/dev/null; then
+    echo -e "[zram0]\nzram-size = min(ram, 8192)" > /etc/systemd/zram-generator.conf
+fi
+
+# --- Desktop Config ---
 if [[ "$DE_NAME" == "sway" ]]; then
     cat > /etc/environment <<ENV
 QT_QPA_PLATFORM=wayland
@@ -256,7 +246,7 @@ exec nm-applet --indicator
 exec blueman-applet
 exec mako
 exec wl-paste --watch cliphist store
-gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+exec gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
 SWAYCONF
         if [ "$IS_LAPTOP" == "true" ]; then
              echo "exec kanshi" >> /home/$USER_NAME/.config/sway/config
@@ -265,17 +255,21 @@ SWAYCONF
     chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
 fi
 
-# Bootloader
+# --- Bootloader & Initramfs ---
 bootctl install
-# REMOVED sd-plymouth hook to prevent errors
-sed -i 's/^HOOKS=.*/HOOKS=(systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt lvm2 filesystems)/' /etc/mkinitcpio.conf
+
+# HOOKS: Udev standard
+sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
-echo "title Arch Linux" > /boot/loader/entries/arch.conf
-echo "linux /vmlinuz-$KERNEL" >> /boot/loader/entries/arch.conf
-echo "initrd /$UCODE.img" >> /boot/loader/entries/arch.conf
-echo "initrd /initramfs-$KERNEL.img" >> /boot/loader/entries/arch.conf
-echo "options rd.luks.name=\$(blkid -s UUID -o value $P_ROOT)=cryptroot root=/dev/mapper/vg0-root rw quiet" >> /boot/loader/entries/arch.conf
+# Loader Entry
+cat > /boot/loader/entries/arch.conf <<ENTRY
+title Arch Linux
+linux /vmlinuz-$KERNEL
+initrd /$UCODE.img
+initrd /initramfs-$KERNEL.img
+options rd.luks.name=$LUKSUUID=cryptroot root=/dev/mapper/vg0-root rw quiet
+ENTRY
 echo "default arch.conf" > /boot/loader/loader.conf
 
 # Services
@@ -284,7 +278,7 @@ systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 
 if [[ "$DM" == "ly" ]]; then
     systemctl disable getty@tty2.service
-    systemctl enable ly@ttyX.service
+    systemctl enable ly@tty2.service
 else
     systemctl enable "$DM"
 fi
@@ -301,4 +295,4 @@ collect_input
 prepare_disk
 install_base
 config_system
-log_succ "Installation Complete. Remove USB and Reboot."
+log_succ "DONE. Remove USB and Reboot."
