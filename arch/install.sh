@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v5.7 (Critical Fixes)
-# DESCRIPTION:  Fixes Mirrorlist Copy path. Removes sd-vconsole. Robust Mirrors.
+# PROJECT:      Arch Linux Installer v6.0 (Clean HW Detection)
+# DESCRIPTION:  Dynamic Module Loading. Clean Configs. Sway/Nvidia ready.
 # TARGET:       Workstation & Gaming
 # AUTHOR:       Rogerio Sobrinho (Refactored by Gemini)
 # DATE:         2026-01-19
@@ -23,7 +23,7 @@ trap 'log_err "Script failed at line $LINENO"' ERR
 
 # --- CONFIG ---
 HOSTNAME_DEFAULT="archlinux"
-KEYMAP="us-intl"
+KEYMAP_CONSOLE="us" 
 FONT_CONSOLE="latarcyrheb-sun16" 
 
 # --- PACKAGES ---
@@ -65,6 +65,13 @@ PKGS_KDE=(plasma-desktop sddm dolphin konsole xdg-desktop-portal-kde ark spectac
 PKGS_LAPTOP=(tlp kanshi brightnessctl)
 PKGS_GAME=(steam lutris gamemode mangohud wine-staging winetricks openrgb)
 
+# --- GLOBAL VARS FOR HW DETECTION ---
+GPU_PKGS=()
+HW_MODULES=""
+KERNEL_PARAMS="rw"
+IS_LAPTOP="false"
+UCODE=""
+
 # --- FUNCTIONS ---
 
 pre_flight() {
@@ -75,7 +82,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v5.7 (Final Fixes) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v6.0 (Smart HW Detect) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -112,6 +119,46 @@ collect_input() {
     read -r -s -p "Pass: " USER_PASS; echo ""
 }
 
+detect_hw() {
+    log_info "Detecting Hardware..."
+    
+    # CPU
+    CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
+    [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
+    
+    # GPU & Modules
+    # Using concatenation to support Hybrid Graphics (Intel + Nvidia/AMD)
+    
+    if lspci | grep -qi "Intel"; then 
+        GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+        HW_MODULES="${HW_MODULES} i915"
+    fi
+    
+    if lspci | grep -qi "AMD"; then 
+        GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
+        HW_MODULES="${HW_MODULES} amdgpu"
+    fi
+    
+    if lspci | grep -qi "NVIDIA"; then 
+        GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils)
+        # Proprietary Nvidia modules for Early KMS + Wayland
+        HW_MODULES="${HW_MODULES} nvidia nvidia_modeset nvidia_uvm nvidia_drm"
+        KERNEL_PARAMS="${KERNEL_PARAMS} nvidia-drm.modeset=1"
+    fi
+    
+    # Chassis
+    if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
+        IS_LAPTOP="true"
+        log_info "Type: Laptop"
+    else
+        log_info "Type: Desktop"
+    fi
+    
+    # Trim whitespace from modules
+    HW_MODULES=$(echo "$HW_MODULES" | xargs)
+    log_info "Detected Modules: $HW_MODULES"
+}
+
 prepare_disk() {
     log_info "Wiping $TARGET..."
     wipefs -af "$TARGET"; sgdisk -Zo "$TARGET"
@@ -142,27 +189,13 @@ prepare_disk() {
     [[ -n "$SWAP_DEV" ]] && swapon "$SWAP_DEV"
 }
 
-detect_hw() {
-    CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-    [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
-    
-    GPU_PKGS=()
-    if lspci | grep -qi "NVIDIA"; then GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils); fi
-    if lspci | grep -qi "AMD"; then GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon); fi
-    if lspci | grep -qi "Intel"; then GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel); fi
-    
-    IS_LAPTOP="false"
-    if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
-        IS_LAPTOP="true"
-    fi
-}
-
 install_base() {
-    log_info "Optimizing Mirrors (Global Top 5)..."
-    # FIX: Add timeout and robust sorting. 
-    # If reflector fails, we continue with existing list but warn.
+    # 1. Hardware detection MUST run before pacstrap to determine packages
+    detect_hw
+
+    log_info "Optimizing Mirrors..."
     if ! reflector --latest 20 --number 5 --protocol https --sort rate --download-timeout 10 --save /etc/pacman.d/mirrorlist; then
-        log_info "Reflector warning: Mirror optimization failed. Using default mirrors."
+        log_err "Reflector failed. Check internet."
     fi
     
     log_info "Pacman Config..."
@@ -170,13 +203,7 @@ install_base() {
     sed -i 's/^#Color/Color/' /etc/pacman.conf
     sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
-    
-    # Try updating repos with retry
-    for i in {1..3}; do
-        if pacman -Sy --noconfirm; then break; else sleep 2; fi
-    done
-    
-    detect_hw
+    pacman -Sy --noconfirm
     
     PKG_LIST=(
         "${PKGS_BASE[@]}" "$KERNEL" "$K_HEADERS" "$UCODE" 
@@ -190,44 +217,37 @@ install_base() {
     [[ "$OPT_GAME" == "y" ]] && PKG_LIST+=("${PKGS_GAME[@]}")
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
-    log_info "Installing Packages (with Retry)..."
+    log_info "Installing Packages..."
     for i in {1..3}; do
-        if pacstrap -K /mnt "${PKG_LIST[@]}"; then
-            break
-        else
-            log_info "Pacstrap failed. Retrying ($i/3)..."
-            sleep 5
-        fi
-        if [[ $i -eq 3 ]]; then log_err "Pacstrap failed after 3 attempts. Check your internet."; fi
+        if pacstrap -K /mnt "${PKG_LIST[@]}"; then break; else sleep 5; fi
+        if [[ $i -eq 3 ]]; then log_err "Pacstrap failed."; fi
     done
     
     genfstab -U /mnt >> /mnt/etc/fstab
+    log_info "Copying mirrorlist..."
+    cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
 }
 
 config_system() {
     log_info "Configuring System..."
     LUKSUUID=$(blkid -s UUID -o value "$P_ROOT")
 
-    # FIX: Copy mirrorlist OUTSIDE chroot (host to target path mounted at /mnt)
-    log_info "Copying mirrorlist..."
-    cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-
     cat <<EOF > /mnt/setup.sh
 #!/bin/bash
 set -e
 
-# Time & Locale
+# 1. Time & Locale
 ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
 hwclock --systohc
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen; locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "$HOSTNAME_VAL" > /etc/hostname
 
-# VConsole (Explicitly created before mkinitcpio)
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+# 2. VConsole
+echo "KEYMAP=$KEYMAP_CONSOLE" > /etc/vconsole.conf
 echo "FONT=$FONT_CONSOLE" >> /etc/vconsole.conf
 
-# Repos & Users
+# 3. Pacman & Users
 sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
 sed -i 's/^#Color/Color/' /etc/pacman.conf
 sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
@@ -244,12 +264,12 @@ echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 
 flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
-# ZRAM Config
+# 4. ZRAM
 if pacman -Q zram-generator &>/dev/null; then
     echo -e "[zram0]\nzram-size = min(ram, 8192)" > /etc/systemd/zram-generator.conf
 fi
 
-# --- Desktop Config ---
+# 5. Desktop (Sway)
 if [[ "$DE_NAME" == "sway" ]]; then
     cat > /etc/environment <<ENV
 QT_QPA_PLATFORM=wayland
@@ -272,6 +292,8 @@ exec blueman-applet
 exec mako
 exec wl-paste --watch cliphist store
 exec gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+input * xkb_layout "us"
+input * xkb_variant "intl"
 SWAYCONF
         if [ "$IS_LAPTOP" == "true" ]; then
              echo "exec kanshi" >> /home/$USER_NAME/.config/sway/config
@@ -280,14 +302,18 @@ SWAYCONF
     chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
 fi
 
-# --- Bootloader & Initramfs ---
+# 6. Bootloader & Initramfs
 bootctl install
 
-# HOOKS: Force standard Udev hooks.
-# Removes any potential sd-vconsole or sd-lvm2 garbage.
-sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems)/' /etc/mkinitcpio.conf
+# DYNAMIC MODULES INJECTION
+# Cleanest approach: Only add what hardware was detected.
+cat > /etc/mkinitcpio.conf <<MKCONF
+MODULES=($HW_MODULES dm_mod dm_crypt ext4)
+BINARIES=()
+FILES=()
+HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems fsck)
+MKCONF
 
-# Rebuild images
 mkinitcpio -P
 
 # Loader Entry
@@ -296,11 +322,11 @@ title Arch Linux
 linux /vmlinuz-$KERNEL
 initrd /$UCODE.img
 initrd /initramfs-$KERNEL.img
-options rd.luks.name=$LUKSUUID=cryptroot root=/dev/mapper/vg0-root rw quiet
+options rd.luks.name=$LUKSUUID=cryptroot root=/dev/mapper/vg0-root $KERNEL_PARAMS
 ENTRY
 echo "default arch.conf" > /boot/loader/loader.conf
 
-# Services
+# 7. Services
 systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 [[ "$IS_LAPTOP" == "true" ]] && systemctl enable tlp
 
@@ -323,4 +349,4 @@ collect_input
 prepare_disk
 install_base
 config_system
-log_succ "DONE. Remove USB and Reboot."
+log_succ "Installation Complete. Remove USB and Reboot."
