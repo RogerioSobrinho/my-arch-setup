@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v5.6 (Global Mirrors)
-# DESCRIPTION:  Reflector: Top 5 Global/Rate. Retry Logic. Fixed Services.
+# PROJECT:      Arch Linux Installer v5.7 (Critical Fixes)
+# DESCRIPTION:  Fixes Mirrorlist Copy path. Removes sd-vconsole. Robust Mirrors.
 # TARGET:       Workstation & Gaming
 # AUTHOR:       Rogerio Sobrinho (Refactored by Gemini)
 # DATE:         2026-01-19
@@ -75,7 +75,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v5.6 (Global Top 5) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v5.7 (Final Fixes) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -159,15 +159,22 @@ detect_hw() {
 
 install_base() {
     log_info "Optimizing Mirrors (Global Top 5)..."
-    # FIX: Get latest 20 synced mirrors worldwide, pick top 5 by speed
-    reflector --latest 20 --number 5 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+    # FIX: Add timeout and robust sorting. 
+    # If reflector fails, we continue with existing list but warn.
+    if ! reflector --latest 20 --number 5 --protocol https --sort rate --download-timeout 10 --save /etc/pacman.d/mirrorlist; then
+        log_info "Reflector warning: Mirror optimization failed. Using default mirrors."
+    fi
     
     log_info "Pacman Config..."
     sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
     sed -i 's/^#Color/Color/' /etc/pacman.conf
     sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
-    pacman -Sy
+    
+    # Try updating repos with retry
+    for i in {1..3}; do
+        if pacman -Sy --noconfirm; then break; else sleep 2; fi
+    done
     
     detect_hw
     
@@ -184,15 +191,14 @@ install_base() {
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
     log_info "Installing Packages (with Retry)..."
-    # FIX: Retry logic for unstable connections
     for i in {1..3}; do
         if pacstrap -K /mnt "${PKG_LIST[@]}"; then
             break
         else
             log_info "Pacstrap failed. Retrying ($i/3)..."
-            sleep 3
+            sleep 5
         fi
-        if [[ $i -eq 3 ]]; then log_err "Pacstrap failed after 3 attempts."; fi
+        if [[ $i -eq 3 ]]; then log_err "Pacstrap failed after 3 attempts. Check your internet."; fi
     done
     
     genfstab -U /mnt >> /mnt/etc/fstab
@@ -201,6 +207,10 @@ install_base() {
 config_system() {
     log_info "Configuring System..."
     LUKSUUID=$(blkid -s UUID -o value "$P_ROOT")
+
+    # FIX: Copy mirrorlist OUTSIDE chroot (host to target path mounted at /mnt)
+    log_info "Copying mirrorlist..."
+    cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
 
     cat <<EOF > /mnt/setup.sh
 #!/bin/bash
@@ -213,14 +223,11 @@ echo "en_US.UTF-8 UTF-8" > /etc/locale.gen; locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "$HOSTNAME_VAL" > /etc/hostname
 
-# VConsole
+# VConsole (Explicitly created before mkinitcpio)
 echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 echo "FONT=$FONT_CONSOLE" >> /etc/vconsole.conf
 
 # Repos & Users
-# FIX: Ensure target uses the same optimized mirrorlist
-cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-
 sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
 sed -i 's/^#Color/Color/' /etc/pacman.conf
 sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
@@ -276,8 +283,11 @@ fi
 # --- Bootloader & Initramfs ---
 bootctl install
 
-# HOOKS: Udev standard
+# HOOKS: Force standard Udev hooks.
+# Removes any potential sd-vconsole or sd-lvm2 garbage.
 sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems)/' /etc/mkinitcpio.conf
+
+# Rebuild images
 mkinitcpio -P
 
 # Loader Entry
@@ -314,4 +324,3 @@ prepare_disk
 install_base
 config_system
 log_succ "DONE. Remove USB and Reboot."
-
