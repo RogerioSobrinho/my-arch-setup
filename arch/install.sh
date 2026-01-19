@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v4.7 (Final Fix)
-# DESCRIPTION:  Official Repos Only. No AUR. Correct Service names.
+# PROJECT:      Arch Linux Installer v4.8 (Desktop Crash Fix)
+# DESCRIPTION:  Fixed grep failure on Desktops causing script to exit.
 # AUTHOR:       Rogerio Sobrinho (Reviewed by Gemini AI)
 # DATE:         2026-01-18
 # ==============================================================================
@@ -20,7 +20,7 @@ log_succ() { echo -e "${GREEN}[OK]${NC}   $1"; }
 log_err()  { echo -e "${RED}[ERR]${NC}  $1"; exit 1; }
 
 error_handler() {
-    log_err "Script failed at line $1. Check your internet or mirrorlist."
+    log_err "Script failed at line $1."
 }
 trap 'error_handler $LINENO' ERR
 
@@ -28,7 +28,7 @@ trap 'error_handler $LINENO' ERR
 HOSTNAME_DEFAULT="archlinux"
 KEYMAP="us-intl"
 
-# --- PACKAGES (Strictly Official Repos) ---
+# --- PACKAGES (Official Only) ---
 
 PKGS_BASE=(base base-devel linux-firmware lvm2 sof-firmware archlinux-keyring linux-lts linux-lts-headers)
 
@@ -51,7 +51,7 @@ PKGS_APPS=(firefox thunderbird flatpak)
 PKGS_DEV=(docker docker-compose docker-buildx)
 PKGS_THEMES_GLOBAL=(gnome-themes-extra adwaita-icon-theme glib2)
 
-# Sway Profile (All Official)
+# Sway Profile
 PKGS_SWAY=(
     sway swaybg swayidle swaylock dmenu ly foot 
     xdg-desktop-portal-wlr xdg-desktop-portal-gtk 
@@ -80,7 +80,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v4.7 (Stable) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v4.8 (Stable) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -147,16 +147,41 @@ prepare_disk() {
 
 detect_hw() {
     log_info "Detecting HW..."
+    
+    # CPU
     CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-    [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
+    if [[ "$CPU_V" == "GenuineIntel" ]]; then
+         UCODE="intel-ucode"
+         log_info "CPU: Intel"
+    else
+         UCODE="amd-ucode"
+         log_info "CPU: AMD"
+    fi
     
+    # GPU
     GPU_PKGS=()
-    if lspci | grep -qi "NVIDIA"; then GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils); fi
-    if lspci | grep -qi "AMD"; then GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon); fi
-    if lspci | grep -qi "Intel"; then GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel); fi
+    if lspci | grep -qi "NVIDIA"; then 
+        log_info "GPU: NVIDIA"
+        GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils)
+    fi
+    if lspci | grep -qi "AMD"; then 
+        log_info "GPU: AMD"
+        GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
+    fi
+    if lspci | grep -qi "Intel"; then 
+        log_info "GPU: Intel"
+        GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+    fi
     
+    # Chassis (CRITICAL FIX: Use if/else to avoid set -e crash on Desktop)
     IS_LAPTOP="false"
-    grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null && IS_LAPTOP="true"
+    if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
+        IS_LAPTOP="true"
+        log_info "Type: Laptop"
+    else
+        IS_LAPTOP="false"
+        log_info "Type: Desktop"
+    fi
 }
 
 install_base() {
@@ -189,13 +214,13 @@ install_base() {
     [[ "$OPT_GAME" == "y" ]] && PKG_LIST+=("${PKGS_GAME[@]}")
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
-    log_info "Installing packages (Official Repos Only)..."
+    log_info "Installing packages..."
     pacstrap -K /mnt "${PKG_LIST[@]}"
     genfstab -U /mnt >> /mnt/etc/fstab
 }
 
 config_system() {
-    log_info "Configuring System..."
+    log_info "System Config..."
     cat <<EOF > /mnt/setup.sh
 #!/bin/bash
 ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
@@ -270,9 +295,7 @@ systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 [[ "$IS_LAPTOP" == "true" ]] && systemctl enable tlp
 
 if [[ "$DM" == "ly" ]]; then
-    # Disable getty@tty2 to free TTY2 for Ly
     systemctl disable getty@tty2.service
-    # Enable Ly (Standard official package unit)
     systemctl enable ly.service
 else
     systemctl enable "$DM"
