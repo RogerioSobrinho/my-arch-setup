@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJECT:      Arch Linux Installer v4.8 (Desktop Crash Fix)
-# DESCRIPTION:  Fixed grep failure on Desktops causing script to exit.
+# PROJECT:      Arch Linux Installer v5.0 (Stable & Barebones)
+# DESCRIPTION:  Official Repos Only. No Mirror Optimization. No AUR.
+# TARGET:       Workstation & Gaming
 # AUTHOR:       Rogerio Sobrinho (Reviewed by Gemini AI)
 # DATE:         2026-01-18
 # ==============================================================================
@@ -20,7 +21,7 @@ log_succ() { echo -e "${GREEN}[OK]${NC}   $1"; }
 log_err()  { echo -e "${RED}[ERR]${NC}  $1"; exit 1; }
 
 error_handler() {
-    log_err "Script failed at line $1."
+    log_err "Script failed at line $1. Check internet connection."
 }
 trap 'error_handler $LINENO' ERR
 
@@ -37,7 +38,7 @@ PKGS_SYS=(
     bash-completion fzf fastfetch trash-cli ripgrep fd jq
     htop ncdu plocate
     unzip p7zip unrar atool tree
-    rsync wget curl bind reflector
+    rsync wget curl bind
     restic
 )
 
@@ -51,7 +52,7 @@ PKGS_APPS=(firefox thunderbird flatpak)
 PKGS_DEV=(docker docker-compose docker-buildx)
 PKGS_THEMES_GLOBAL=(gnome-themes-extra adwaita-icon-theme glib2)
 
-# Sway Profile
+# Sway Profile (All Official)
 PKGS_SWAY=(
     sway swaybg swayidle swaylock dmenu ly foot 
     xdg-desktop-portal-wlr xdg-desktop-portal-gtk 
@@ -80,7 +81,7 @@ pre_flight() {
 
 collect_input() {
     clear
-    echo -e "${CYAN}=== Arch Installer v4.8 (Stable) ===${NC}"
+    echo -e "${CYAN}=== Arch Installer v5.0 (No Mirrors/AUR) ===${NC}"
     
     read -r -p "Hostname [${HOSTNAME_DEFAULT}]: " HOSTNAME_VAL
     HOSTNAME_VAL=${HOSTNAME_VAL:-$HOSTNAME_DEFAULT}
@@ -147,39 +148,19 @@ prepare_disk() {
 
 detect_hw() {
     log_info "Detecting HW..."
-    
-    # CPU
     CPU_V=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-    if [[ "$CPU_V" == "GenuineIntel" ]]; then
-         UCODE="intel-ucode"
-         log_info "CPU: Intel"
-    else
-         UCODE="amd-ucode"
-         log_info "CPU: AMD"
-    fi
+    [[ "$CPU_V" == "GenuineIntel" ]] && UCODE="intel-ucode" || UCODE="amd-ucode"
     
-    # GPU
     GPU_PKGS=()
-    if lspci | grep -qi "NVIDIA"; then 
-        log_info "GPU: NVIDIA"
-        GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils)
-    fi
-    if lspci | grep -qi "AMD"; then 
-        log_info "GPU: AMD"
-        GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
-    fi
-    if lspci | grep -qi "Intel"; then 
-        log_info "GPU: Intel"
-        GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
-    fi
+    if lspci | grep -qi "NVIDIA"; then GPU_PKGS+=(nvidia-dkms nvidia-utils lib32-nvidia-utils); fi
+    if lspci | grep -qi "AMD"; then GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon); fi
+    if lspci | grep -qi "Intel"; then GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel); fi
     
-    # Chassis (CRITICAL FIX: Use if/else to avoid set -e crash on Desktop)
     IS_LAPTOP="false"
     if grep -EEq "^(8|9|10|14|31|32)$" /sys/class/dmi/id/chassis_type 2>/dev/null; then
         IS_LAPTOP="true"
         log_info "Type: Laptop"
     else
-        IS_LAPTOP="false"
         log_info "Type: Desktop"
     fi
 }
@@ -188,13 +169,17 @@ install_base() {
     log_info "Configuring Pacman..."
     sed -i 's/^#Parallel/Parallel/' /etc/pacman.conf
     sed -i 's/^#Color/Color/' /etc/pacman.conf
+    # Verbose disabled to avoid clutter on slow connections
+    # sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
     
     # Enable Multilib on ISO
-    log_info "Enabling Multilib..."
+    log_info "Enabling Multilib on ISO..."
     sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
     pacman -Sy
 
-    reflector --country Brazil --country 'United States' --protocol https --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
+    # SKIPPING REFLECTOR: Using default ISO mirrors to avoid bad mirrors
+    # reflector ...
+    
     detect_hw
     
     PKG_LIST=(
@@ -215,7 +200,9 @@ install_base() {
     [[ "$OPT_HIB" != "y" ]] && PKG_LIST+=("zram-generator")
 
     log_info "Installing packages..."
-    pacstrap -K /mnt "${PKG_LIST[@]}"
+    if ! pacstrap -K /mnt "${PKG_LIST[@]}"; then
+        log_err "Pacstrap failed! Check your internet/mirrors."
+    fi
     genfstab -U /mnt >> /mnt/etc/fstab
 }
 
@@ -280,6 +267,7 @@ fi
 
 # Bootloader
 bootctl install
+# REMOVED sd-plymouth hook to prevent errors
 sed -i 's/^HOOKS=.*/HOOKS=(systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt lvm2 filesystems)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
@@ -291,7 +279,7 @@ echo "options rd.luks.name=\$(blkid -s UUID -o value $P_ROOT)=cryptroot root=/de
 echo "default arch.conf" > /boot/loader/loader.conf
 
 # Services
-systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer reflector.timer
+systemctl enable NetworkManager bluetooth firewalld apparmor docker fstrim.timer
 [[ "$IS_LAPTOP" == "true" ]] && systemctl enable tlp
 
 if [[ "$DM" == "ly" ]]; then
